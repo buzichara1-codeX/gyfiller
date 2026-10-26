@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "GBP Filler",
+  "version": "0.7.1",
+  "minimum_chrome_version": "116",
+  "description": "Безопасный редактор шаблонов Google Business Profile.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting",
+    "storage",
+    "tabGroups",
+    "unlimitedStorage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://www.google.com/*",
+    "https://www.google.ru/*",
+    "https://business.google.com/*",
+    "https://docs.google.com/spreadsheets/*"
+  ],
+  "icons": {
+    "16": "icons/gy-icon-v3-16.png",
+    "32": "icons/gy-icon-v3-32.png",
+    "48": "icons/gy-icon-v3-48.png",
+    "128": "icons/gy-icon-v3-128.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/gy-icon-v3-16.png",
+      "32": "icons/gy-icon-v3-32.png"
+    },
+    "default_popup": "popup.html",
+    "default_title": "GBP Filler"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src https://docs.google.com"
+  },
+  "version_name": "0.7.1a+ab8d181d6611"
+}

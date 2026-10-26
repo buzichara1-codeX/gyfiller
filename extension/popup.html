@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>GBP Filler</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="icons/gy-icon-v3-32.png">
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <header><span class="mark"><img src="icons/gy-icon-v3-48.png" alt=""></span><div><strong>GBP Filler</strong><small id="subtitle">Проверка вкладки</small></div></header>
+    <main>
+      <div id="state" class="status pending" role="status" aria-live="polite"><span class="dot"></span><div><b>Проверяем вкладку…</b><p>Откройте профиль компании в Google.</p></div></div>
+      <dl>
+        <div><dt>Подключена вкладка</dt><dd id="bound" class="muted">нет</dd></div>
+        <div><dt>Режим</dt><dd>Браузер</dd></div>
+        <div><dt>API</dt><dd id="api" class="muted">не настроен</dd></div>
+      </dl>
+      <button id="connect" hidden>Подключить эту вкладку</button>
+      <button id="open" disabled>Открыть редактор</button>
+      <button id="network" hidden>Открыть сеть в редакторе</button>
+      <button id="retry" class="secondary">Проверить снова</button>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
