@@ -39,5 +39,5 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src https://docs.google.com"
   },
-  "version_name": "0.7.1a+ab8d181d6611"
+  "version_name": "0.7.1b+59b557610151"
 }

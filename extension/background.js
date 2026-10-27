@@ -1,4 +1,10 @@
 let approved;
+// Panel events: the extension panel listens on runtime messages; a pilot QA panel (localhost) on a port.
+const qaPorts = new Set();
+function broadcast(message) {
+  for (const port of qaPorts) { try { port.postMessage(message); } catch { qaPorts.delete(port); } }
+  return chrome.runtime.sendMessage(message);
+}
 let descriptionPilotApproved;
 const CONTENT_PROTOCOL = "r32";
 const contentMessage = (type, payload = {}) => ({ type: `${type}:${CONTENT_PROTOCOL}`, ...payload });
@@ -93,7 +99,7 @@ async function captureSourceTab() {
   await markWorkTab(tab, previousTabId);
   approved = undefined;
   descriptionPilotApproved = undefined; supervisedApproved = undefined;
-  chrome.runtime.sendMessage({ type: "approval_stale", reason: "source_binding_changed" }).catch(() => {});
+  broadcast({ type: "approval_stale", reason: "source_binding_changed" }).catch(() => {});
   return tab;
 }
 
@@ -112,17 +118,57 @@ const sourceUrl = value => {
     || /^\/(?:search|local\/business)(?:\/|$)/.test(url.pathname);
 };
 
+// Owner 27.10: which Google account a tab belongs to, from the avatar button label in the page corner
+// («Аккаунт Google: Имя (почта)» / «Google Account: Name (email)»). Shown in the panel only; never stored.
+async function googleAccountLabel(tabId) {
+  try {
+    const [result] = await chrome.scripting.executeScript({ target: { tabId }, func: () => {
+      const label = [...document.querySelectorAll("a[aria-label], button[aria-label], div[aria-label]")]
+        .map(element => (element.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim())
+        .find(text => /^(?:Аккаунт Google|Google Account):/i.test(text)) || "";
+      const match = /^(?:Аккаунт Google|Google Account):\s*(.*?)\s*\(([^()\s]+@[^()\s]+)\)/i.exec(label);
+      return match ? { name: match[1].trim(), email: match[2].trim() } : undefined;
+    } });
+    return result?.result || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function listGoogleSources() {
   const tabs = await chrome.tabs.query({});
-  return { tabs: await Promise.all(tabs.filter(tab => tab.id && sourceUrl(tab.url)).map(async tab => ({
-    id: tab.id, title: tab.title || "Google", url: `${new URL(tab.url).origin}${new URL(tab.url).pathname}`,
-    tabHash: await tabIdentity(tab)
-  }))) };
+  return { tabs: await Promise.all(tabs.filter(tab => tab.id && sourceUrl(tab.url)).map(async tab => {
+    const url = new URL(tab.url);
+    // R-117: tell identical titles apart — Google profile (u/N or authuser) and kind of page; no query is exposed.
+    const account = /\/u\/(\d+)(?:\/|$)/.exec(url.pathname)?.[1] ?? /[?&]authuser=(\d+)/.exec(tab.url)?.[1] ?? "0";
+    return {
+      id: tab.id, title: tab.title || "Google", url: `${url.origin}${url.pathname}`,
+      account, kind: url.hostname === "business.google.com" ? "list" : "card", active: Boolean(tab.active),
+      // A tab Chrome unloaded after a restart cannot be read; prefer a loaded, recently used copy.
+      ready: !tab.discarded && tab.status === "complete", lastAccessed: tab.lastAccessed || 0,
+      googleAccount: !tab.discarded && tab.status === "complete" ? await googleAccountLabel(tab.id) : undefined,
+      tabHash: await tabIdentity(tab)
+    };
+  })) };
+}
+
+// After a Chrome restart tabs come back unloaded (discarded) and cannot be read. Load the page the way a
+// user would by opening it, and wait until it is complete. Only a page that is not loaded is reloaded.
+async function ensureTabLoaded(tabId) {
+  let tab = await chrome.tabs.get(tabId);
+  if (tab.discarded || tab.status === "unloaded") await chrome.tabs.reload(tabId);
+  else if (tab.status !== "loading") return tab;
+  for (let waited = 0; waited < 25000; waited += 300) {
+    await pause(300);
+    tab = await chrome.tabs.get(tabId);
+    if (!tab.discarded && tab.status === "complete") { await pause(1200); return chrome.tabs.get(tabId); }
+  }
+  throw new Error("Вкладка Google не загрузилась. Откройте её и выберите снова.");
 }
 
 async function connectGoogleSource(input) {
   if (!Number.isInteger(input.tabId) || typeof input.tabHash !== "string") throw new Error("Выберите вкладку Google заново.");
-  const tab = await chrome.tabs.get(input.tabId);
+  const tab = await ensureTabLoaded(input.tabId);
   if (!sourceUrl(tab?.url) || await tabIdentity(tab) !== input.tabHash) {
     throw new Error("Вкладка изменилась. Обновите список и выберите её заново.");
   }
@@ -131,14 +177,36 @@ async function connectGoogleSource(input) {
   const previousTabId = await sessionGet("sourceTabId");
   await sessionSet({ sourceTabId: tab.id, sourceWindowId: tab.windowId });
   await markWorkTab(tab, previousTabId);
-  await chrome.runtime.sendMessage({ type: "approval_stale", reason: "source_binding_changed" }).catch(() => {});
+  await broadcast({ type: "approval_stale", reason: "source_binding_changed" }).catch(() => {});
   const profile = await inspectSource(false);
   const after = await sourceTab();
   if (after.id !== tab.id || await tabIdentity(after) !== input.tabHash) {
     throw new Error("Вкладка изменилась во время подключения. Выберите источник заново.");
   }
-  await chrome.runtime.sendMessage({ type: "source_status_ui", profile }).catch(() => {});
+  await broadcast({ type: "source_status_ui", profile }).catch(() => {});
   return profile;
+}
+
+// Live 27.10: «Дочитать» turns the Google list page itself and waits until the next rows are shown.
+async function managerNextPage() {
+  const tab = await sourceTab();
+  const before = await inspectSource(false);
+  const from = before.managerContext?.page?.from;
+  if (before.surface !== "businesses" || !from) return { status: "blocked", blocker: "manager_context_changed" };
+  const result = await sendToSource(tab.id, contentMessage("manager_next_page"));
+  if (result?.status !== "navigating") return result || { status: "blocked", blocker: "manager_next_page_missing" };
+  const deadline = Date.now() + 12000;
+  while (Date.now() < deadline) {
+    await pause(300);
+    if (await sessionGet("sourceTabId") !== tab.id) return { status: "blocked", blocker: "source_tab_changed" };
+    const profile = await inspectSource(false).catch(() => undefined);
+    if (profile && ["captcha", "reverification"].includes(profile.blocker)) return { status: "blocked", blocker: profile.blocker };
+    if (profile?.managerContext?.page?.from && profile.managerContext.page.from !== from) {
+      await broadcast({ type: "source_status_ui", profile }).catch(() => {});
+      return { status: "ready", profile };
+    }
+  }
+  return { status: "blocked", blocker: "manager_next_page_timeout" };
 }
 
 async function selectManagerGroup(input) {
@@ -153,7 +221,7 @@ async function selectManagerGroup(input) {
   }
   approved = undefined;
   descriptionPilotApproved = undefined;
-  await chrome.runtime.sendMessage({ type: "approval_stale", reason: "manager_context_changed" }).catch(() => {});
+  await broadcast({ type: "approval_stale", reason: "manager_context_changed" }).catch(() => {});
   const result = await sendToSource(tab.id, contentMessage("select_manager_group", {
     groupId: input.groupId, label: input.label, contextKey: input.contextKey
   }));
@@ -177,7 +245,7 @@ async function selectManagerGroup(input) {
       if (profile.surface === "businesses" && context && context.group.kind !== "unknown"
         && context.group.label === input.label && (!input.groupId || context.group.id === input.groupId)
         && (!profile.blocker || profile.blocker === "manager_selection_required")) {
-        await chrome.runtime.sendMessage({ type: "source_status_ui", profile }).catch(() => {});
+        await broadcast({ type: "source_status_ui", profile }).catch(() => {});
         return { status: "ready", profile };
       }
     } catch (error) {
@@ -211,12 +279,87 @@ async function sendToSource(tabId, message) {
   }
 }
 
+// Live 27.10: an English Google interface shows the same address transliterated (Курская → Kurskaya).
+// Same place only when every number matches and the meaningful words match in Latin (see domain.ts).
+const RU_LATIN = { а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "yo", ж: "zh", з: "z", и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o",
+  п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f", х: "kh", ц: "ts", ч: "ch", ш: "sh", щ: "shch", ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya" };
+const ADDRESS_NOISE = new Set(["ulitsa", "ulica", "ul", "street", "st", "prospekt", "pr", "avenue", "per", "pereulok", "lane",
+  "dom", "d", "g", "gorod", "city", "oblast", "obl", "region", "kray", "krai", "respublika", "resp", "republic", "rossiya", "russia", "rf",
+  "etazh", "floor", "ofis", "office", "pom", "pomeshchenie", "korpus", "k", "str", "stroenie"]);
+const addressTokens = value => [...String(value || "").normalize("NFKC").toLocaleLowerCase("ru")].map(c => RU_LATIN[c] ?? c).join("")
+  .replace(/['\u2019]/g, "").split(/[^a-z0-9]+/).filter(Boolean);
+const sameAddressAcrossScripts = (a, b) => {
+  if (!a || !b) return false;
+  const [ta, tb] = [addressTokens(a), addressTokens(b)];
+  const numbers = tokens => tokens.filter(token => /^\d/.test(token));
+  const [na, nb] = [numbers(ta), numbers(tb)];
+  if (!na.length || !nb.length) return false;
+  const [fewN, manyN] = na.length <= nb.length ? [na, nb] : [nb, na];
+  if (!fewN.every(n => manyN.includes(n))) return false;
+  const words = tokens => tokens.filter(token => !/^\d/.test(token) && token.length >= 3 && !ADDRESS_NOISE.has(token));
+  const [wa, wb] = [words(ta), words(tb)];
+  const [few, many] = wa.length <= wb.length ? [wa, wb] : [wb, wa];
+  return few.length > 0 && few.every(word => many.some(other => other.slice(0, 5) === word.slice(0, 5)));
+};
+
+// Live 27.10: Google Business Profile Manager opens a card from the list in a NEW tab (google.com/search).
+// The panel keeps one working tab: it moves that card into the source tab, closes the extra tab and
+// remembers the list URL so «return to the list» works after the content script was reloaded.
+async function openManagerProfileFollowingNewTab(tab, candidate) {
+  await sessionSet({ managerReturnUrl: tab.url });
+  let onCreated;
+  const newTab = new Promise(resolve => {
+    onCreated = created => { if (created.openerTabId === tab.id) resolve(created); };
+    chrome.tabs.onCreated?.addListener(onCreated);
+  });
+  const inPlace = sendToSource(tab.id, contentMessage("open_manager_profile", { candidate }))
+    .catch(error => ({ status: "blocked", blocker: "manager_open_failed", error: String(error) }));
+  try {
+    const first = await Promise.race([inPlace.then(result => ({ inPlace: result })), newTab.then(created => ({ created }))]);
+    if (first.inPlace) return first.inPlace;
+    let created = first.created;
+    for (let waited = 0; (!created.url || created.url === "about:blank") && !created.pendingUrl && waited < 10000; waited += 250) {
+      await pause(250);
+      created = await chrome.tabs.get(created.id).catch(() => created);
+    }
+    const url = created.pendingUrl || created.url;
+    if (!sourceUrl(url)) return { status: "blocked", blocker: "manager_open_failed" };
+    await chrome.tabs.remove(created.id).catch(() => {});
+    await chrome.tabs.update(tab.id, { url });
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      await pause(400);
+      const profile = await inspectSource(false).catch(() => undefined);
+      if (profile && ["captcha", "reverification"].includes(profile.blocker)) return { status: "blocked", blocker: profile.blocker };
+      if (profile?.name && profile.address) {
+        const [shown, wanted] = [normalizeIdentity(profile.name), normalizeIdentity(candidate?.name)];
+        // Google may show only the brand part of a long title in the card header (same rule as the panel: >= 5 chars, contained).
+        const sameName = shown === wanted || (Math.min(shown.length, wanted.length) >= 5 && (wanted.includes(shown) || shown.includes(wanted)));
+        const sameAddress = normalizeIdentity(profile.address) === normalizeIdentity(candidate?.address) || sameAddressAcrossScripts(profile.address, candidate?.address);
+        if (!sameName || !sameAddress) return { status: "blocked", blocker: "manager_open_identity_mismatch" };
+        // The name and address render before the card buttons: wait for «Edit profile» so the read does not start too early.
+        for (let waited = 0; waited < 10000; waited += 400) {
+          const [probe] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => [...document.querySelectorAll("button,a,[role=button]")]
+            .some(element => /^(?:edit profile|изменить профиль)$/i.test((element.innerText || "").trim()) && element.getBoundingClientRect().width > 0) }).catch(() => [{}]);
+          if (probe?.result) break;
+          await pause(400);
+        }
+        return { status: "ready" };
+      }
+    }
+    return { status: "blocked", blocker: "manager_open_timeout" };
+  } finally {
+    chrome.tabs.onCreated?.removeListener(onCreated);
+  }
+}
+
 async function returnToManager(tab) {
-  const response = await sendToSource(tab.id, contentMessage("return_manager"));
-  const managerUrl = response?.managerUrl;
+  const response = await sendToSource(tab.id, contentMessage("return_manager")).catch(() => undefined);
+  const remembered = await sessionGet("managerReturnUrl");
+  const managerUrl = response?.status === "return_ready" ? response.managerUrl : remembered;
   let parsed;
   try { parsed = new URL(managerUrl); } catch { return { status: "blocked", blocker: "manager_return_unproven" }; }
-  if (response?.status !== "return_ready" || parsed.hostname !== "business.google.com"
+  if (parsed.hostname !== "business.google.com"
     || !/\/locations(?:[/?]|$)/.test(parsed.pathname)) {
     return { status: "blocked", blocker: "manager_return_unproven" };
   }
@@ -863,7 +1006,7 @@ async function scanManagerNetwork() {
 
 async function refreshManagerSourceStatus() {
   const profile = await inspectSource(false);
-  await chrome.runtime.sendMessage({ type: "source_status_ui", profile }).catch(() => {});
+  await broadcast({ type: "source_status_ui", profile }).catch(() => {});
   return profile;
 }
 
@@ -1100,7 +1243,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (tabId === await sessionGet("sourceTabId") && changeInfo.url) {
     approved = undefined;
     descriptionPilotApproved = undefined; supervisedApproved = undefined;
-    chrome.runtime.sendMessage({ type: "approval_stale", reason: "source_tab_changed" }).catch(() => {});
+    broadcast({ type: "approval_stale", reason: "source_tab_changed" }).catch(() => {});
   }
   // The old snapshot is retained by the workspace, but the current group must
   // be re-read after navigation. SPA-only changes arrive via the observer below.
@@ -1116,7 +1259,7 @@ chrome.tabs.onRemoved.addListener(async tabId => {
     approved = undefined;
     descriptionPilotApproved = undefined; supervisedApproved = undefined;
     await chrome.storage.session.remove(["sourceTabId", "sourceWindowId"]);
-    await chrome.runtime.sendMessage({ type: "approval_stale", reason: "source_tab_closed" }).catch(() => {});
+    await broadcast({ type: "approval_stale", reason: "source_tab_closed" }).catch(() => {});
   }
 });
 
@@ -1159,14 +1302,24 @@ async function returnFocus(sender) {
   } catch { /* the panel may have been closed meanwhile */ }
 }
 
-chrome.runtime.onMessage.addListener((message, sender, reply) => {
+const panelListener = (message, sender, reply) => {
   if (!VISIBLE_SOURCE_JOBS.has(message.type)) return routeMessage(message, sender, reply);
   bringSourceForward().then(() => {
     const finish = value => { returnFocus(sender).finally(() => reply(value)); };
     if (routeMessage(message, sender, finish) !== true) returnFocus(sender);
   });
   return true;
-});
+};
+chrome.runtime.onMessage.addListener(panelListener);
+// Pilot live QA only: the manifest key externally_connectable exists only in the pilot build. It lets the
+// same panel UI, served from localhost inside a test browser's own tab group, talk to this background.
+if (chrome.runtime.getManifest?.().externally_connectable) {
+  chrome.runtime.onMessageExternal.addListener(panelListener);
+  chrome.runtime.onConnectExternal.addListener(port => {
+    qaPorts.add(port);
+    port.onDisconnect.addListener(() => qaPorts.delete(port));
+  });
+}
 
 function routeMessage(message, sender, reply) {
   const respond = promise => {
@@ -1180,7 +1333,7 @@ function routeMessage(message, sender, reply) {
   if (message.type === "inspect_source") {
     return respond(captureSourceTab().then(async () => {
       const profile = await inspectSource(false);
-      await chrome.runtime.sendMessage({ type: "source_status_ui", profile }).catch(() => {});
+      await broadcast({ type: "source_status_ui", profile }).catch(() => {});
       return profile;
     }));
   }
@@ -1193,7 +1346,7 @@ function routeMessage(message, sender, reply) {
       // source again and invalidate even when the new scope is still unknown.
       approved = undefined;
       descriptionPilotApproved = undefined;
-      await chrome.runtime.sendMessage({ type: "approval_stale", reason: "manager_context_changed" }).catch(() => {});
+      await broadcast({ type: "approval_stale", reason: "manager_context_changed" }).catch(() => {});
       await refreshManagerSourceStatus();
       return { status: "refreshed" };
     })());
@@ -1211,9 +1364,7 @@ function routeMessage(message, sender, reply) {
           return { status: "blocked", blocker: "manager_context_changed" };
         }
       }
-      return sendToSource(tab.id, contentMessage("open_manager_profile", {
-        candidate: message.candidate
-      }));
+      return openManagerProfileFollowingNewTab(tab, message.candidate);
     })());
   }
   if (message.type === "return_manager") {
@@ -1227,10 +1378,11 @@ function routeMessage(message, sender, reply) {
   if (message.type === "source_status") {
     return respond((async () => {
       const profile = await inspectSource(false);
-      return { connected: true, sourceTabId: profile.sourceTabId, profile };
+      return { connected: true, sourceTabId: profile.sourceTabId, profile, googleAccount: await googleAccountLabel(profile.sourceTabId) };
     })());
   }
   if (message.type === "list_google_sources") return respond(listGoogleSources());
+  if (message.type === "source_account") return respond(sourceTab().then(tab => googleAccountLabel(tab.id)).then(account => ({ account })).catch(() => ({ account: undefined })));
   if (message.type === "connect_google_source") return respond(connectGoogleSource(message));
   if (message.type === "select_manager_group") return respond(selectManagerGroup(message));
   if (message.type === "api_status") {
@@ -1275,6 +1427,7 @@ function routeMessage(message, sender, reply) {
       return { ok: true };
     })());
   }
+  if (message.type === "manager_next_page") return respond(managerNextPage());
   if (message.type === "scan_network") {
     approved = undefined;
     descriptionPilotApproved = undefined; supervisedApproved = undefined;

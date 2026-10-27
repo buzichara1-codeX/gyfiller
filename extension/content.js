@@ -394,7 +394,10 @@
     // Google listens on the inner trigger, so a press must reach the element a
     // real pointer would hit (only if it belongs to the intended control).
     const hit = document.elementFromPoint(init.clientX, init.clientY);
-    const element = hit && target.contains(hit) ? hit : target;
+    // Never land on another option of a closed list: that would choose it instead of opening the list.
+    const hitOption = hit && hit.closest && hit.closest('[role="option"],option');
+    // The shown (selected) option of a closed Google listbox is its trigger: pressing it opens the list (live 27.10).
+    const element = hit && target.contains(hit) && (!hitOption || hitOption === target || hitOption.getAttribute("aria-selected") === "true") ? hit : target;
     element.dispatchEvent(new PointerEvent("pointerdown", { ...init, pointerId: 1, isPrimary: true }));
     element.dispatchEvent(new MouseEvent("mousedown", init));
     element.dispatchEvent(new PointerEvent("pointerup", { ...init, pointerId: 1, isPrimary: true }));
@@ -896,6 +899,29 @@
     return unresolved;
   }
 
+  // Live 27.10: an English Google interface shows the same address transliterated (Курская → Kurskaya).
+  // Same place only when every number matches and the meaningful words match in Latin (see domain.ts).
+  const RU_LATIN = { а: "a", б: "b", в: "v", г: "g", д: "d", е: "e", ё: "yo", ж: "zh", з: "z", и: "i", й: "y", к: "k", л: "l", м: "m", н: "n", о: "o",
+    п: "p", р: "r", с: "s", т: "t", у: "u", ф: "f", х: "kh", ц: "ts", ч: "ch", ш: "sh", щ: "shch", ъ: "", ы: "y", ь: "", э: "e", ю: "yu", я: "ya" };
+  const ADDRESS_NOISE = new Set(["ulitsa", "ulica", "ul", "street", "st", "prospekt", "pr", "avenue", "per", "pereulok", "lane",
+    "dom", "d", "g", "gorod", "city", "oblast", "obl", "region", "kray", "krai", "respublika", "resp", "republic", "rossiya", "russia", "rf",
+    "etazh", "floor", "ofis", "office", "pom", "pomeshchenie", "korpus", "k", "str", "stroenie"]);
+  const addressTokens = value => [...String(value || "").normalize("NFKC").toLocaleLowerCase("ru")].map(c => RU_LATIN[c] ?? c).join("")
+    .replace(/['\u2019]/g, "").split(/[^a-z0-9]+/).filter(Boolean);
+  const sameAddressAcrossScripts = (a, b) => {
+    if (!a || !b) return false;
+    const [ta, tb] = [addressTokens(a), addressTokens(b)];
+    const numbers = tokens => tokens.filter(token => /^\d/.test(token));
+    const [na, nb] = [numbers(ta), numbers(tb)];
+    if (!na.length || !nb.length) return false;
+    const [fewN, manyN] = na.length <= nb.length ? [na, nb] : [nb, na];
+    if (!fewN.every(n => manyN.includes(n))) return false;
+    const words = tokens => tokens.filter(token => !/^\d/.test(token) && token.length >= 3 && !ADDRESS_NOISE.has(token));
+    const [wa, wb] = [words(ta), words(tb)];
+    const [few, many] = wa.length <= wb.length ? [wa, wb] : [wb, wa];
+    return few.length > 0 && few.every(word => many.some(other => other.slice(0, 5) === word.slice(0, 5)));
+  };
+
   async function openManagerProfile(candidate) {
     const body = text(document.body);
     const currentSurface = surface();
@@ -945,7 +971,7 @@
       const identity = extractIdentity();
       if (!identity.name || !identity.address) return undefined;
       if (normalize(identity.name) !== normalize(candidate.name)
-        || normalize(identity.address) !== normalize(candidate.address)) {
+        || (normalize(identity.address) !== normalize(candidate.address) && !sameAddressAcrossScripts(identity.address, candidate.address))) {
         return { blocker: "manager_open_identity_mismatch" };
       }
       runtime.identity = identity;
@@ -1131,7 +1157,7 @@
     ["contact", "socialProfiles", "Социальные профили", "list", /^(?:social profiles|социальные профили|профили в социальных сетях)$/],
     ["location", "businessLocation", "Адрес", "text", /^(?:business location|адрес компании|местоположение компании)$/],
     ["location", "serviceArea", "Зона обслуживания", "list", /^(?:service area|service areas|зона обслуживания|район обслуживания|территория обслуживания)$/],
-    ["hours", "hours", "Основные часы", "hours", /^(?:hours|business hours|opening hours|open with main hours|основные часы|часы работы|открыто в основные часы)$/],
+    ["hours", "hours", "Основные часы", "hours", /^(?:hours|business hours|opening hours|open with main hours|основные часы|часы работы|открыто в основные часы|открыто с указанием часов работы)$/],
     ["hours", "specialHours", "Специальные часы", "hours", /^(?:special hours|специальные часы|измененный график|изменённый график)$/],
     ["hours", "onlineHours", "Онлайн-часы", "hours", /^(?:online(?:\s+(?:operating|service|customer))?\s+hours|online-hours|онлайн(?:\s+(?:рабочие|операционные))?[-\s]часы|часы онлайн-обслуживания)$/],
     ["hours", "moreHours", "Дополнительные часы", "hours", /^(?:add more hours|more hours|дополнительные часы)$/]
@@ -1169,7 +1195,8 @@
   };
   const captureValue = (control, label, kind, labelPattern) => {
     const lines = controlLines(control);
-    const ignored = /^(?:add|добавить|edit|изменить|change|primary|primary category|основная категория)$/i;
+    // «ОСНОВНОЙ»/«Основная» is the badge next to the primary category in the ru editor, not a value.
+    const ignored = /^(?:add|добавить|edit|изменить|change|primary|primary category|основная категория|основной|основная|additional|дополнительная|дополнительные)$/i;
     const remaining = lines.filter(value => !labelPattern.test(normalize(value))
       && !ignored.test(value) && !explicitEmptyPattern.test(value));
     const directValue = "value" in control && typeof control.value === "string"
@@ -2672,6 +2699,16 @@
         profiles: [],
         scrollPositions: 0
       }));
+      return true;
+    }
+    // Live 27.10: open the next page of the Businesses list (the «Далее» / «Next page» pager button). Navigation only.
+    if (messageIs(message, "manager_next_page")) {
+      const pager = [...document.querySelectorAll('[role="button"][aria-label],button[aria-label]')]
+        .find(element => /^(?:далее|следующая страница|next|next page)$/i.test((element.getAttribute("aria-label") || "").trim()) && isVisible(element));
+      if (!pager) { reply({ status: "blocked", blocker: "manager_next_page_missing" }); return true; }
+      if (pager.getAttribute("aria-disabled") === "true" || pager.disabled) { reply({ status: "last_page" }); return true; }
+      reply({ status: "navigating" });
+      setTimeout(() => pressLikeUser(pager), 0);
       return true;
     }
     if (messageIs(message, "select_manager_group")) {
